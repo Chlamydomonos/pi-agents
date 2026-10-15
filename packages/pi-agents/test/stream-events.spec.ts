@@ -10,6 +10,8 @@ import {
     wrapToolArguments,
     sourcePrefix,
     toolResultLine,
+    ASK_USER_TOOL_NAME,
+    ASK_USER_POSTED_TEXT,
 } from '../src/extension/session/stream-events.js';
 
 describe('wrapToolArguments(docs/30 §4.2/§4.3)', () => {
@@ -48,6 +50,13 @@ describe('占位工具常量(docs/30 §4)', () => {
     it('固定名与固定文案', () => {
         expect(PLACEHOLDER_TOOL_NAME).toBe('agents_tool');
         expect(PLACEHOLDER_RESULT_TEXT).toContain('占位');
+    });
+});
+
+describe('ask_user 桥接常量(真实透传给宿主 pi-web)', () => {
+    it('真实工具名与 posted 文案', () => {
+        expect(ASK_USER_TOOL_NAME).toBe('ask_user');
+        expect(ASK_USER_POSTED_TEXT).toContain('问题已提交');
     });
 });
 

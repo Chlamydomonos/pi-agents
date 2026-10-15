@@ -1,11 +1,5 @@
 /**
- * wakeFlow 转发契约测试(docs/40 §4.2 防回归):
- * seedInputOf 声明在 WakeArgs 顶层(index 构造),run-node 从 env.seedInputOf 读取。
- * 曾因 wakeFlow 未把顶层字段转发进 executor env,导致 inherit 首唤醒
- * 永远拿不到宿主历史(resume 后记忆丢失,真实环境验收暴露)。
- *
- * 行为级验证:桩 NodeSession 捕获 seed prompt 的实际文本——
- * seed 生效 → session.prompt 第一次收到 digest;断链复发 → 不再触发 seed prompt。
+ * wakeFlow 契约测试:函数节点 ctx.host(宿主会话只读视图,docs/20 §2.2)。
  */
 import { describe, expect, it } from 'vitest';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
@@ -32,10 +26,9 @@ function fakeNodeSession(prompts: string[], messages: AgentMessage[]) {
             subscribe: (_fn: (e: { type: string }) => void) => () => {},
             prompt: async (input: string) => {
                 prompts.push(input);
-                // 每次 prompt 后补一条 assistant 消息,保证 lastAssistant 存在且结局为 stop
                 messages.push({
                     role: 'assistant',
-                    content: [{ type: 'text', text: `回复:${input}` }],
+                    content: [{ type: 'text', text: '回复:' + input }],
                     stopReason: 'stop',
                 } as unknown as AgentMessage);
             },
@@ -51,7 +44,7 @@ function fakeNodeSession(prompts: string[], messages: AgentMessage[]) {
                         return (m.content ?? [])
                             .filter((b) => b.type === 'text')
                             .map((b) => b.text ?? '')
-                            .join('\n');
+                            .join('');
                     }
                 }
                 return '';
@@ -59,89 +52,6 @@ function fakeNodeSession(prompts: string[], messages: AgentMessage[]) {
         },
     };
 }
-
-function makeArgs(seedInputOf: WakeArgs['seedInputOf']): {
-    args: WakeArgs;
-    seedPrompts: string[];
-} {
-    const seedPrompts: string[] = [];
-    const messages: AgentMessage[] = [];
-    const ns = fakeNodeSession(seedPrompts, messages);
-    const args: WakeArgs = {
-        flow,
-        hostMessages: [
-            { role: 'user', content: '旧问题' },
-            { role: 'assistant', content: [{ type: 'text', text: '旧回答' }] },
-            { role: 'user', content: '本次输入' },
-        ] as unknown as AgentMessage[],
-        wakeIndex: 1,
-        hostSessionId: 'h',
-        maxHops: 8,
-        ...(seedInputOf !== undefined ? { seedInputOf } : {}),
-        env: {
-            flowName: 'notes',
-            pool: {
-                acquire: async () => ({
-                    session: ns.session,
-                    sessionManager: {} as never,
-                    seeded: false,
-                    identity: 'i',
-                    wakeIndex: 1,
-                }),
-                markSeeded: () => {},
-            },
-            config,
-            agentsByName: new Map([
-                [
-                    'notetaker',
-                    {
-                        name: 'notetaker',
-                        title: '纪要员',
-                        description: 't',
-                        systemPrompt: '整理纪要',
-                        tools: [],
-                        sessionMode: 'inherit',
-                    },
-                ],
-            ]),
-            hostToolNames: new Set<string>(),
-            cwd: () => '/tmp',
-            resolveModel: () => undefined,
-            warn: () => {},
-            lorebookOf: () => [],
-            flowContext: flow,
-            flowByName: () => flow,
-            usageLedger: () => undefined,
-        } as unknown as WakeArgs['env'],
-    };
-    return { args, seedPrompts };
-}
-
-describe('wakeFlow seedInputOf 转发契约(防回归:resume 后 inherit 记忆丢失)', () => {
-    it('WakeArgs 顶层的 seedInputOf 必须生效:首唤醒先注入 digest', async () => {
-        const { args, seedPrompts } = makeArgs(() => '<宿主历史摘要>旧问题/旧回答');
-        const outcome = await wakeFlow(args);
-        expect(outcome.ok).toBe(true);
-        expect(seedPrompts.length).toBe(2); // seed digest + 本次输入
-        expect(seedPrompts[0]).toContain('<宿主历史摘要>');
-    });
-
-    it('顶层无 seedInputOf 时回退 env.seedInputOf(子流程/测试直接挂 env 的路径)', async () => {
-        const { args, seedPrompts } = makeArgs(undefined);
-        (args.env as { seedInputOf?: () => string }).seedInputOf = () => '<env 级摘要>';
-        const outcome = await wakeFlow(args);
-        expect(outcome.ok).toBe(true);
-        expect(seedPrompts.length).toBe(2);
-        expect(seedPrompts[0]).toContain('<env 级摘要>');
-    });
-
-    it('无任何 seedInputOf(历史为空场景)→ 跳过 seed,直接注入本次输入', async () => {
-        const { args, seedPrompts } = makeArgs(undefined);
-        const outcome = await wakeFlow(args);
-        expect(outcome.ok).toBe(true);
-        expect(seedPrompts).toEqual(['本次输入']);
-    });
-});
 
 describe('wakeFlow → 函数节点 ctx.host(宿主会话只读视图,docs/20 §2.2)', () => {
     it('函数节点拿到宿主请求消息的 role 投影;view 字段与 wake 一致', async () => {
@@ -190,11 +100,9 @@ describe('wakeFlow → 函数节点 ctx.host(宿主会话只读视图,docs/20 §
                     acquire: async () => ({
                         session: ns.session,
                         sessionManager: {} as never,
-                        seeded: false,
                         identity: 'i',
                         wakeIndex: 2,
                     }),
-                    markSeeded: () => {},
                 },
                 config,
                 agentsByName: new Map([
@@ -228,5 +136,74 @@ describe('wakeFlow → 函数节点 ctx.host(宿主会话只读视图,docs/20 §
         expect(seen?.lastOutput).toBe('上一轮');
         expect(seen?.messages[0]).toMatchObject({ role: 'user', content: '旧问题' });
         expect(seen?.messages[1]?.role).toBe('assistant');
+    });
+});
+
+describe('wakeFlow ask 挂起(ask_user 桥接 → 工作流提前落定)', () => {
+    it('节点末轮以 ask_user toolUse 收尾 → AskPostedError → ok 落定(terminal=该节点;后续节点不跑)', async () => {
+        // ask 后还有下一个节点:若挂起失效,peek 会执行并成为终点 → 用它反证
+        const askFlow: FlowDefinition = {
+            name: 'ask-flow',
+            title: 't',
+            description: 't',
+            nodes: {
+                main: { agent: 'notetaker', sessionMode: 'fresh' },
+                peek: { run: () => '不该执行' },
+            },
+            entry: 'main',
+            edges: { main: 'peek' },
+        };
+        const prompts: string[] = [];
+        const messages: AgentMessage[] = [];
+        const ns = fakeNodeSession(prompts, messages);
+        // 覆写 prompt:ask 场景末轮补 toolUse 收尾消息(末块 ask_user)
+        (ns.session as { prompt: (input: string) => Promise<void> }).prompt = async (input: string) => {
+            prompts.push(input);
+            messages.push({
+                role: 'assistant',
+                content: [{ type: 'toolCall', id: 't1', name: 'ask_user', arguments: { questions: [] } }],
+                stopReason: 'toolUse',
+            } as unknown as AgentMessage);
+        };
+        const args: WakeArgs = {
+            flow: askFlow,
+            hostMessages: [{ role: 'user', content: '本次输入' }] as unknown as AgentMessage[],
+            wakeIndex: 1,
+            hostSessionId: 'h',
+            maxHops: 8,
+            env: {
+                flowName: 'ask-flow',
+                pool: {
+                    acquire: async () => ({
+                        session: ns.session,
+                        sessionManager: {} as never,
+                        identity: 'i',
+                        wakeIndex: 1,
+                    }),
+                },
+                config,
+                agentsByName: new Map([
+                    [
+                        'notetaker',
+                        { name: 'notetaker', title: 't', description: 't', systemPrompt: 'x', tools: ['ask_user'] },
+                    ],
+                ]),
+                hostToolNames: new Set<string>(['ask_user']),
+                cwd: () => '/tmp',
+                resolveModel: () => undefined,
+                warn: () => {},
+                lorebookOf: () => [],
+                flowContext: askFlow,
+                flowByName: () => askFlow,
+                usageLedger: () => undefined,
+            } as unknown as WakeArgs['env'],
+        };
+        const outcome = await wakeFlow(args);
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        // 提前落定:terminal = 提问节点;后续 fn 节点未执行
+        expect(outcome.result.terminal).toBe('main');
+        expect(outcome.result.text).toBe('');
+        expect(outcome.result.trail).toEqual([{ node: 'main', visit: 1, text: '' }]);
     });
 });

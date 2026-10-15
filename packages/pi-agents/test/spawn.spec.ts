@@ -190,7 +190,6 @@ describe('runSpawn:Agent 引用', () => {
         >(async () => ({
             session: built.session as never,
             sessionManager: {} as never,
-            seeded: true,
             identity: 'x',
             wakeIndex: 3,
         }));
@@ -212,7 +211,6 @@ describe('runSpawn:Agent 引用', () => {
             return {
                 session: built.session as never,
                 sessionManager: {} as never,
-                seeded: true,
                 identity: 'x',
                 wakeIndex: 1,
             };

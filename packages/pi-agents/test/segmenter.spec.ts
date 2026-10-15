@@ -115,6 +115,54 @@ describe('FlowSegmenter(docs/30 §6)', () => {
         // fn 不切段:同段两块 text(t1/t2 同块累积)
         expect(final!.blocks.filter((b) => b.type === 'text')).toHaveLength(1);
     });
+
+    it('ask-user:出真实 ask_user toolCall 专属段(endsWithToolCall=true;不套 agents_tool)', () => {
+        const seg = new FlowSegmenter();
+        const all = feedAll(seg, [
+            { kind: 'node-start', nodeKey: 'a', label: '询问', visit: 1, isAgent: true },
+            { kind: 'thinking-delta', sourceKey: 'a#1', sourceLabel: '询问', delta: '想想问什么' },
+            {
+                kind: 'ask-user',
+                sourceKey: 'a#1',
+                sourceLabel: '询问',
+                ask: { questions: [{ id: 'q1', question: '去哪吃?' }] },
+            },
+        ]);
+        // 事件序:thinking-delta(思考) → segment-end(思考段) → segment-end(ask 段)
+        const segEnds = all.filter((e) => e.type === 'segment-end') as Extract<SegmentEvent, { type: 'segment-end' }>[];
+        expect(segEnds).toHaveLength(2);
+        const askSeg = segEnds[1]!.segment;
+        expect(askSeg.endsWithToolCall).toBe(true);
+        expect(askSeg.blocks).toHaveLength(1);
+        const call = askSeg.blocks[0]!;
+        expect(call.type).toBe('toolCall');
+        if (call.type !== 'toolCall') return;
+        // 关键断言:真实名 ask_user(宿主执行 pi-web 本体),arguments 只有 questions
+        expect(call.name).toBe('ask_user');
+        expect(call.arguments).toEqual({ questions: [{ id: 'q1', question: '去哪吃?' }] });
+        const final = seg.finish();
+        expect(final).toBeNull(); // ask 段已闭合,无遗留
+    });
+
+    it('ask-user 后工作流继续:ask 段边界后新段照常(状态行 flush 进下一段)', () => {
+        const seg = new FlowSegmenter();
+        feedAll(seg, [
+            { kind: 'node-start', nodeKey: 'a', label: '询问', visit: 1, isAgent: true },
+            {
+                kind: 'ask-user',
+                sourceKey: 'a#1',
+                sourceLabel: '询问',
+                ask: { questions: [{ id: 'q1', question: 'q?' }] },
+            },
+            { kind: 'tool-result', sourceKey: 'a#1', sourceLabel: '询问', line: '✓ ask_user' },
+            { kind: 'text-delta', sourceKey: 'a#2', sourceLabel: '询问', delta: '收到', isTerminal: true },
+        ]);
+        const final = seg.finish();
+        expect(final).not.toBeNull();
+        expect(final!.endsWithToolCall).toBe(false);
+        const thinking = final!.blocks.find((b) => b.type === 'thinking');
+        expect(thinking && thinking.type === 'thinking' ? thinking.thinking : '').toContain('✓ ask_user');
+    });
 });
 
 function pushThinking(seg: FlowSegmenter, delta: string): void {

@@ -22,8 +22,8 @@
  */
 
 import type { JsonObject } from '@earendil-works/pi-ai';
-import type { NodeEvent, PlaceholderToolCall } from './stream-events.js';
-import { PLACEHOLDER_TOOL_NAME } from './stream-events.js';
+import type { NodeEvent, PlaceholderToolCall, AskUserPayload } from './stream-events.js';
+import { PLACEHOLDER_TOOL_NAME, ASK_USER_TOOL_NAME } from './stream-events.js';
 
 /** 单个内容块(流式期间的形式) */
 export type SegmentBlock =
@@ -154,6 +154,28 @@ export class FlowSegmenter {
             case 'tool-result': {
                 // 工具结果摘要行 → 状态行通道(下一段 thinking 开头 flush;段已在 tool-call 闭合)
                 this.pushStatusLine(ev.line);
+                break;
+            }
+            case 'ask-user': {
+                // ask_user 真实透传(见 stream-events.ASK_USER_TOOL_NAME):
+                // 发名为 ask_user 的真实 toolCall 段 → 宿主执行 pi-web 本体
+                //(模型直调不受 model-only 限制,agent-core 不检查 exposure),
+                // 宿主 transcript 落 toolResult(details.ask) → 浏览器弹表单;
+                // pi-web 工具 terminate:true 结束本轮 → 回答以 followUp 唤醒。
+                this.closeCurrent();
+                this.ensureOpen();
+                this.flushStatusLines();
+                this.flushPendingPrefix();
+                const ask = ev.ask;
+                const call = {
+                    type: 'toolCall' as const,
+                    id: this.toolCallIdOf(),
+                    name: ASK_USER_TOOL_NAME,
+                    arguments: { questions: ask.questions } as unknown as JsonObject,
+                };
+                this.current!.blocks.push(call);
+                this.current!.endsWithToolCall = true;
+                this.closeCurrent();
                 break;
             }
             case 'node-text':

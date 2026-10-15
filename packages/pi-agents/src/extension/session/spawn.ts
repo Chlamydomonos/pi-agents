@@ -24,8 +24,9 @@ import type { AgentDefinition, FlowDefinition, SubagentSpec } from '../types.js'
 import type { WakeOutcome } from './runtime.js';
 import { wakeFlow } from './runtime.js';
 import type { RunNodeEnv, UsageDelta } from './run-node.js';
-import { AbortedError } from './run-node.js';
+import { AskPostedError, AbortedError } from './run-node.js';
 import type { NodeSession } from './pool.js';
+import { ASK_USER_TOOL_NAME, type AskUserQuestionPayload } from './stream-events.js';
 import { appendPathSegment, subAgentSegment, subflowSegment } from './usage.js';
 
 /** spawn_* 工具名前缀(10 §6) */
@@ -192,6 +193,12 @@ async function runAgentRef(
         try {
             const { usage } = await promptSubSession(ns, input, deps);
             const text = ns.session.getLastAssistantText() ?? '';
+            // ask 挂起:子代理末轮以桥接 ask_user 收尾 → 上抛挂起(父工作流止于此;
+            // runtime 捕获落定;宿主执行 pi-web ask_user 后本轮终止)
+            const lastMsg = lastAssistantMsg(ns.session.messages as AgentMessage[]);
+            if (lastMsg && lastMsg.stopReason === 'toolUse' && endsWithAskCall(lastMsg)) {
+                throw new AskPostedError(deps.poolScope.nodeKey, text, deps.poolScope.wakeIndex);
+            }
             // M7 记账(docs/40 §6):父路径 > sub:<name>
             deps.env.usageLedger?.()?.record(appendPathSegment(deps.poolScope.agentPath, subAgentSegment(spec.name)), {
                 ...usage,
@@ -200,7 +207,7 @@ async function runAgentRef(
             emitSpawn(deps, spawnEndFrame(deps.poolScope.wakeIndex, parentPath, spec.name, 'ok', Date.now() - t0));
             return { text, usage, durationMs: Date.now() - t0 };
         } catch (error) {
-            const status = error instanceof AbortedError ? 'aborted' : 'error';
+            const status = error instanceof AbortedError ? 'aborted' : error instanceof AskPostedError ? 'ok' : 'error';
             emitSpawn(deps, spawnEndFrame(deps.poolScope.wakeIndex, parentPath, spec.name, status, Date.now() - t0));
             throw error;
         } finally {
@@ -248,7 +255,6 @@ async function defaultSubSession(
     return {
         session: built.session,
         sessionManager: built.sessionManager,
-        seeded: true,
         identity: `${agentDef.name}:stateless`,
         wakeIndex: deps.poolScope.wakeIndex,
     };
@@ -347,17 +353,32 @@ function pipeSubSessionEvents(ns: NodeSession, label: string, env: RunNodeEnv, v
                 curSourceKey = `sub:${label}#${sourceSeq}`;
                 curSourceLabel = label;
             } else if (e.type === 'toolcall_end') {
-                emit({
-                    kind: 'tool-call',
-                    sourceKey: curSourceKey,
-                    sourceLabel: curSourceLabel,
-                    toolCall: {
-                        agent: label,
-                        tool: e.toolCall.name,
-                        arguments: safeArgs(e.toolCall.arguments),
-                        truncated: false,
-                    },
-                });
+                // ask_user 桥接调用 → 真实透传(宿主执行 pi-web 本体,浏览器弹表单);
+                // 其余工具调用 → 占位 agents_tool 包装。载荷畸形时退回占位包装(防御)。
+                const q =
+                    e.toolCall.name === ASK_USER_TOOL_NAME
+                        ? (e.toolCall.arguments as { questions?: AskUserQuestionPayload[] } | undefined)?.questions
+                        : undefined;
+                if (Array.isArray(q) && q.length > 0) {
+                    emit({
+                        kind: 'ask-user',
+                        sourceKey: curSourceKey,
+                        sourceLabel: curSourceLabel,
+                        ask: { questions: q },
+                    });
+                } else {
+                    emit({
+                        kind: 'tool-call',
+                        sourceKey: curSourceKey,
+                        sourceLabel: curSourceLabel,
+                        toolCall: {
+                            agent: label,
+                            tool: e.toolCall.name,
+                            arguments: safeArgs(e.toolCall.arguments),
+                            truncated: false,
+                        },
+                    });
+                }
             }
         }
     });
@@ -408,6 +429,22 @@ async function promptSubSession(
 
 function safeArgs(args: unknown): JsonObject {
     return typeof args === 'object' && args !== null ? (args as JsonObject) : {};
+}
+
+function lastAssistantMsg(messages: AgentMessage[]): { stopReason?: string; content?: unknown } | undefined {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m && m.role === 'assistant') return m as { stopReason?: string; content?: unknown };
+    }
+    return undefined;
+}
+
+/** 末条 assistant 消息的最后一个 toolCall 是否 ask_user(桥接挂起判定) */
+function endsWithAskCall(msg: { content?: unknown }): boolean {
+    const content = msg.content;
+    if (!Array.isArray(content)) return false;
+    const calls = content.filter((b) => (b as { type?: string }).type === 'toolCall') as Array<{ name?: string }>;
+    return calls[calls.length - 1]?.name === ASK_USER_TOOL_NAME;
 }
 
 function zeroUsage(): UsageDelta {

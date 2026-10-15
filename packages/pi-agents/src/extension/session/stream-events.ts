@@ -35,6 +35,8 @@ export type NodeEvent =
       }
     /** 子会话真实工具调用 → 占位 agents_tool 调用(§4) */
     | { kind: 'tool-call'; sourceKey: string; sourceLabel: string; toolCall: PlaceholderToolCall }
+    /** 子会话 ask_user 调用 → 宿主真实 ask_user 调用(宿主执行 pi-web 本体,浏览器弹表单) */
+    | { kind: 'ask-user'; sourceKey: string; sourceLabel: string; ask: AskUserPayload }
     /** 子会话工具结果摘要行(§3.3;不含在 thinking 块内的场合由 stream 层决定) */
     | { kind: 'tool-result'; sourceKey: string; sourceLabel: string; line: string }
     /** 节点最终文本就绪(结果回补:首个 Agent 节点曾按终点流式,若非工作流终点需纠偏) */
@@ -54,6 +56,40 @@ export interface PlaceholderToolCall {
 
 /** 占位工具固定名(docs/30 §4.2:惰性固定集) */
 export const PLACEHOLDER_TOOL_NAME = 'agents_tool';
+
+/**
+ * ask_user 真实透传工具名:pi-web 在宿主 session 注册的提问工具。
+ * 子会话内的同名桥接工具(见 run-node)只把参数原样上抛;真实执行发生在
+ * 宿主 agent loop——宿主把该调用写进宿主 transcript 并执行 pi-web 本体,
+ * 浏览器才能渲染提问表单(pi-web 按 transcript 里 toolName==='ask_user' 的
+ * toolResult details.ask 渲染/回查)。因此这类调用不发占位 agents_tool。
+ */
+export const ASK_USER_TOOL_NAME = 'ask_user';
+
+/** ask_user 单个选项(与 pi-web AskUserOptionParams 对齐;形状校验在桥接工具参数 schema) */
+export interface AskUserOptionPayload {
+    value: string;
+    label: string;
+    detail?: string;
+}
+
+/** ask_user 单个问题(与 pi-web AskUserQuestionParams 对齐) */
+export interface AskUserQuestionPayload {
+    id: string;
+    question: string;
+    detail?: string;
+    options?: AskUserOptionPayload[];
+    multiple?: boolean;
+}
+
+/** ask_user 调用载荷(questions 原样上抛;形状由桥接工具 schema 保证) */
+export interface AskUserPayload {
+    questions: AskUserQuestionPayload[];
+}
+
+/** pi-web ask_user 成功结果文案(与 askUserTool.postedText 同义;宿主执行时以 pi-web 本体为准) */
+export const ASK_USER_POSTED_TEXT =
+    '问题已提交给用户;回答将作为后续消息送达(可能包含未回答的题)。不要重复提交这些问题。';
 
 /** 占位工具返回固定文案(docs/30 §4.1) */
 export const PLACEHOLDER_RESULT_TEXT = '该工具已在工作流内部真实执行完毕;此结果仅为占位,无需处理。';

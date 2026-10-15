@@ -1,9 +1,8 @@
 /**
- * 工作流唤醒运行时(docs/40 §4 唤醒语义 + §4.3 引擎接线)。
+ * 工作流唤醒运行时(docs/40 §4 唤醒语义 + §4.2 引擎接线)。
  *
  * 职责:
  *   - 唤醒输入提取:宿主请求末条 user 消息 → 文本(图片块占位,§4.1)
- *   - inherit 历史导入:宿主分支 → 压缩脚本单条 user 消息(§4.2)
  *   - 组装真实 NodeExecutor 并驱动 runFlow(M2 引擎)
  */
 
@@ -21,7 +20,7 @@ import type {
 } from '../types.js';
 import { collectWakeImages, type ImageLimits } from '../shared/images.js';
 import type { AgentFrame } from '../../shared/protocol.js';
-import { AbortedError } from './run-node.js';
+import { AskPostedError, AbortedError } from './run-node.js';
 import type { SessionPool } from './pool.js';
 import { createNodeExecutor, type RunNodeEnv } from './run-node.js';
 import { createFileHelpers } from '../files.js';
@@ -76,53 +75,6 @@ export function extractWakeInput(messages: readonly AgentMessage[], limits: Imag
 }
 
 /* ------------------------------------------------------------------ */
-/*  §4.2 inherit 历史导入(压缩脚本)                                    */
-/* ------------------------------------------------------------------ */
-
-const ASSISTANT_PREVIEW = 300;
-
-function textOf(m: AgentMessage): string {
-    if (m.role === 'user' || m.role === 'assistant') return contentText((m as { content: unknown }).content).text;
-    return '';
-}
-
-/** 历史消息里的图片块数(压缩摘要用;40 §4.2) */
-function imageCountOf(m: AgentMessage): number {
-    if (m.role !== 'user' && m.role !== 'assistant') return 0;
-    return contentText((m as { content: unknown }).content).images;
-}
-
-/**
- * 宿主历史 → 压缩脚本(docs/40 §4.2):
- * user 全文;assistant 文本块前 300 字;丢弃 thinking/占位 toolCall/custom;
- * 历史中的图片块压成 `[图片 N: <mime>, <约xKB>]` 文字摘要(不重灌子会话,docs/20 §9.3)。
- * 返回单条 user 消息文本(作为 inherit 首唤醒的第一条输入)。
- */
-export function buildHistoryDigest(messages: readonly AgentMessage[], wakeInput: string): string {
-    const lines: string[] = ['<以下是用户与本工作流此前的对话摘要>'];
-    let imageSeq = 1;
-    for (const m of messages) {
-        if (m.role === 'user') {
-            const t = textOf(m).trim();
-            const imgs = imageCountOf(m);
-            if (t || imgs > 0) {
-                const imgNotes =
-                    imgs > 0 ? ` [图片 ${Array.from({ length: imgs }, () => `#${imageSeq++}`).join(',')}]` : '';
-                lines.push(`用户:${t}${imgNotes}`);
-            }
-        } else if (m.role === 'assistant') {
-            const t = textOf(m).trim();
-            if (!t) continue;
-            lines.push(t.length > ASSISTANT_PREVIEW ? `助手:${t.slice(0, ASSISTANT_PREVIEW)}…` : `助手:${t}`);
-        }
-        // system/thinking/toolResult/custom 一律丢弃(§4.2)
-    }
-    lines.push('<摘要结束。请基于以上上下文继续。本次任务:>');
-    lines.push(wakeInput);
-    return lines.join('\n');
-}
-
-/* ------------------------------------------------------------------ */
 /*  唤醒驱动                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -130,7 +82,6 @@ export interface WakeArgs {
     flow: FlowDefinition;
     /** 宿主本次请求消息(含 system;内部过滤) */
     hostMessages: readonly AgentMessage[];
-    /** inherit 首唤醒导入用的宿主上下文(同一消息列表;§4.2 取 user/assistant) */
     wakeIndex: number;
     hostSessionId: string;
     /** 上一次唤醒的工作流输出(WakeContext.lastOutput) */
@@ -141,8 +92,6 @@ export interface WakeArgs {
     signal?: AbortSignal;
     /** 引擎 maxHops(配置) */
     maxHops?: number;
-    /** inherit 首唤醒导入文本(docs/40 §4.2):nodeKey → 压缩脚本 */
-    seedInputOf?: (nodeKey: string) => string | undefined;
     /** 中断收尾(docs/40 §8):被中断唤醒涉及的 inherit 节点键,调用方弃池重建 */
     onAbortCleanup?: (nodeKeys: string[]) => void;
     /** M7:成功唤醒结束时持久化用量 entry(pi.appendEntry;index 构造,§6) */
@@ -192,10 +141,6 @@ export async function wakeFlow(args: WakeArgs): Promise<WakeOutcome> {
     const { execute } = createNodeExecutor({
         ...args.env,
         signal: args.signal,
-        // seedInputOf 声明在 WakeArgs 顶层(index 构造),而 run-node 从 env 读取——
-        // 必须在此转发,否则 inherit 首唤醒永远拿不到宿主历史(resume 后暴露的缺陷)。
-        // WakeArgs 顶层优先;env 兜底(测试/子流程直接挂 env 仍生效)。
-        seedInputOf: args.seedInputOf ?? args.env.seedInputOf,
     });
 
     // §8 中断收尾:本唤醒涉及的 inherit 节点(从 trail 之外无法精确恢复中断点,
@@ -237,6 +182,20 @@ export async function wakeFlow(args: WakeArgs): Promise<WakeOutcome> {
                 /* 清理失败不影响中断语义 */
             }
             return { ok: false, aborted: true, error };
+        }
+        if (error instanceof AskPostedError) {
+            // ask 挂起(ask_user 已转发宿主,回答以 followUp 唤醒):按正常落定形态收尾。
+            // text = 提问节点已产出文本(常为空);stream 层在 ask 边界段已完成 toolUse
+            // 收口,宿主执行 pi-web ask_user 后本轮终止,不再消费此 outcome。
+            return {
+                ok: true,
+                result: {
+                    text: error.partialText,
+                    terminal: error.nodeKey,
+                    trail: [{ node: error.nodeKey, visit: error.visit, text: error.partialText }],
+                },
+                wake,
+            };
         }
         if (error instanceof FlowError) return { ok: false, aborted: false, error };
         // 用户代码错误(route/pass/run 抛错已被引擎包成 FlowError;这里是非引擎路径)

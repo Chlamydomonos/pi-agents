@@ -36,7 +36,6 @@ import type { AgentFrame, BrowserFrame } from '../shared/protocol.js';
 import type { Warn } from './loader/validate.js';
 import { AGENT_SUBDIRS, scaffoldAgentsDir } from './scaffold.js';
 import { SessionPool } from './session/pool.js';
-import { buildHistoryDigest } from './session/runtime.js';
 import { createStreamSimple, type StreamDeps } from './session/stream.js';
 import type { RunNodeEnv } from './session/run-node.js';
 import type { LorebookSource } from './session/lorebook.js';
@@ -303,11 +302,6 @@ const extension: ExtensionFactory = async (pi: ExtensionAPI) => {
             const hostMessages = context.messages.filter((m) => m.role !== 'system') as AgentMessage[];
             const flow = flowByName.get(model.id);
             if (!flow) throw new Error(`工作流 "${model.id}" 未注册`);
-            // §4.2:inherit 首唤醒用宿主历史(去 system)生成压缩脚本
-            const seededNodes = new Set<string>();
-            for (const key of Object.keys(flow.nodes)) {
-                if (flow.nodes[key]?.sessionMode === 'inherit') seededNodes.add(key);
-            }
             // M7:每唤醒一个记账器(config.usage 开关;onWakeOk 时 flush appendEntry,§6)
             const ledger = config.usage ? new UsageLedger() : undefined;
             return {
@@ -316,11 +310,6 @@ const extension: ExtensionFactory = async (pi: ExtensionAPI) => {
                 hostSessionId,
                 ...(lastOutputs.has(hostSessionId) ? { lastOutput: lastOutputs.get(hostSessionId) } : {}),
                 maxHops: config.maxHops,
-                seedInputOf: (nodeKey) => {
-                    if (!seededNodes.has(nodeKey)) return undefined;
-                    const digest = buildHistoryDigest(hostMessages, '');
-                    return digest.length > 0 ? digest : undefined;
-                },
                 onAbortCleanup: (nodeKeys) => {
                     void (async () => {
                         for (const key of nodeKeys) await pool.evict(model.id, key, hostSessionId);

@@ -1,6 +1,6 @@
 {
     "name": "@chlamydomonos/pi-agents",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Multi-agent workflows for Pi: TS-defined agents + flow engine exposed as virtual models",
     "type": "module",
     "keywords": [

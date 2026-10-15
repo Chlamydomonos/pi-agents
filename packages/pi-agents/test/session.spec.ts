@@ -1,5 +1,5 @@
 /**
- * M3 session 层单元测试:会话池 / 唤醒输入提取 / 历史摘要 / streamSimple 事件序列。
+ * M3 session 层单元测试:会话池 / 唤醒输入提取 / streamSimple 事件序列。
  * 真实子会话(createAgentSession)不进单测——由 smoke/手工验收覆盖;
  * 这里注入假 create 与假引擎路径。
  */
@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { AssistantMessageEvent } from '@earendil-works/pi-ai';
 import { SessionPool } from '../src/extension/session/pool.js';
-import { extractWakeInput, buildHistoryDigest, projectHostView } from '../src/extension/session/runtime.js';
+import { extractWakeInput, projectHostView } from '../src/extension/session/runtime.js';
 import type { WakeArgs, WakeOutcome } from '../src/extension/session/runtime.js';
 import { createStreamSimple } from '../src/extension/session/stream.js';
 import { resetPendingRunsForTest } from '../src/extension/session/stream.js';
@@ -131,10 +131,10 @@ describe('SessionPool', () => {
         expect(n1 === n2 || n1 === n3 || n2 === n3).toBe(false);
     });
 
-    it('markSeeded/evict/disposeAll:幂等、防泄漏', async () => {
+    it('evict/disposeAll:幂等、防泄漏', async () => {
         const pool = new SessionPool();
         const s = fakeSession();
-        const ns = await pool.acquire({
+        await pool.acquire({
             flowName: 'f',
             nodeKey: 'main',
             hostSessionId: 'h1',
@@ -142,10 +142,8 @@ describe('SessionPool', () => {
             wakeIndex: 1,
             create: async () => ({ session: s.session, sessionManager: {} as never }),
         });
-        expect(ns.seeded).toBe(false);
-        pool.markSeeded('f', 'main', 'h1');
-        // 命中(identity 相同)→ seeded 保留
-        const again = await pool.acquire({
+        // 命中(identity 相同)→ 复用不重建
+        await pool.acquire({
             flowName: 'f',
             nodeKey: 'main',
             hostSessionId: 'h1',
@@ -155,7 +153,6 @@ describe('SessionPool', () => {
                 throw new Error('不应重建');
             },
         });
-        expect(again.seeded).toBe(true);
 
         await pool.evict('f', 'main', 'h1');
         expect(s.state.aborted).toBe(1);
@@ -165,7 +162,7 @@ describe('SessionPool', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/*  唤醒输入提取(§4.1)与历史摘要(§4.2)                                */
+/*  唤醒输入提取(§4.1)                                             */
 /* ------------------------------------------------------------------ */
 
 function userMsg(text: string, images = 0): AgentMessage {
@@ -218,28 +215,6 @@ describe('extractWakeInput', () => {
     });
 });
 
-describe('buildHistoryDigest', () => {
-    it('user 全文;assistant 前 300 字;模板头尾;本次任务拼接', () => {
-        const long = 'x'.repeat(400);
-        const digest = buildHistoryDigest([userMsg('u1'), assistantMsg(long), userMsg('u2')], '新任务');
-        expect(digest).toContain('<以下是用户与本工作流此前的对话摘要>');
-        expect(digest).toContain('用户:u1');
-        expect(digest).toContain(`助手:${'x'.repeat(300)}…`);
-        expect(digest).not.toContain('x'.repeat(301));
-        expect(digest).toContain('用户:u2');
-        expect(digest).toContain('<摘要结束。请基于以上上下文继续。本次任务:>');
-        expect(digest.endsWith('新任务')).toBe(true);
-    });
-
-    it('历史 user 消息中的图片压成 [图片 #n] 文字摘要(40 §4.2)', () => {
-        const digest = buildHistoryDigest([userMsg('看这张', 2), assistantMsg('好的'), userMsg('再来')], '任务');
-        expect(digest).toContain('用户:看这张 [图片 #1,#2]');
-        expect(digest).toContain('用户:再来');
-        expect(digest).not.toContain('[图片 x');
-    });
-});
-
-/* ------------------------------------------------------------------ */
 /*  streamSimple 事件序列(docs/30 §2)                                   */
 /* ------------------------------------------------------------------ */
 
@@ -734,6 +709,42 @@ describe('streamSimple', () => {
             .map((b) => (b as { thinking?: string }).thinking ?? '')
             .join('');
         expect(think).toContain('秘密结果');
+    });
+
+    it('ask-user 透传:真实 ask_user toolCall 边界(toolUse done;不套 agents_tool)', async () => {
+        const events = await runMappedStream((emit) => {
+            emit({ kind: 'node-start', nodeKey: 'a', label: '询问', visit: 1, isAgent: true });
+            emit({ kind: 'thinking-delta', sourceKey: 'a#1', sourceLabel: '询问', delta: '想想' });
+            emit({
+                kind: 'ask-user',
+                sourceKey: 'a#1',
+                sourceLabel: '询问',
+                ask: {
+                    questions: [
+                        { id: 'q1', question: '去哪?' },
+                        { id: 'q2', question: '几点?' },
+                    ],
+                },
+            });
+        }, '问题已提交');
+        const types = assertEventShape(events);
+
+        const done = events.find((e) => e.type === 'done') as {
+            reason: string;
+            message: { content: Array<{ type: string; name?: string; arguments?: unknown }> };
+        };
+        expect(done.reason).toBe('toolUse');
+
+        // 真实 ask_user 调用(非 agents_tool 占位):宿主执行 pi-web 本体
+        const calls = done.message.content.filter((b) => b.type === 'toolCall');
+        expect(calls).toHaveLength(1);
+        const call = calls[0] as { name: string; arguments: { questions: unknown[] } };
+        expect(call.name).toBe('ask_user');
+        expect(call.arguments.questions).toHaveLength(2);
+        expect(call.arguments.questions[0]).toEqual({ id: 'q1', question: '去哪?' });
+        // 边界消息块序 = [thinking, toolCall]
+        expect(done.message.content.map((b) => b.type)).toEqual(['thinking', 'toolCall']);
+        void types;
     });
 });
 

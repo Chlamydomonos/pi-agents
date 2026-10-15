@@ -23,14 +23,22 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
+import { Type } from 'typebox';
+import { defineTool, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { AgentDefinition, FlowDefinition, FlowRunContext, LorebookContext, NodeSpec } from '../types.js';
 import type { NodeExecutor } from '../engine/runner.js';
 import type { PiAgentsConfig } from '../config.js';
 import { SessionPool, type NodeSession } from './pool.js';
-import { wrapToolArguments, type NodeEvent } from './stream-events.js';
+import { wrapToolArguments } from './stream-events.js';
 import { createLorebookHook, toLorebookMessages } from './lorebook-hook.js';
 import type { LorebookSource } from './lorebook.js';
 import { createSpawnTools, normalizeSubagentSpecs, spawnToolName } from './spawn.js';
+import {
+    ASK_USER_POSTED_TEXT,
+    ASK_USER_TOOL_NAME,
+    type AskUserQuestionPayload,
+    type NodeEvent,
+} from './stream-events.js';
 import type { FlowDefinition as FlowDef, SubagentSpec } from '../types.js';
 import { nodePathPrefix, UsageLedger } from './usage.js';
 import type { AgentFrame } from '../../shared/protocol.js';
@@ -63,11 +71,6 @@ export interface RunNodeEnv {
     onUsage?: (usage: UsageDelta) => void;
     /** 宿主中断信号(Esc 级联,D16) */
     signal?: AbortSignal;
-    /**
-     * inherit 首唤醒导入文本(docs/40 §4.2):nodeKey → 压缩脚本;
-     * 返回 undefined/空 = 无历史可导入(跳过 seed)。
-     */
-    seedInputOf?: (nodeKey: string) => string | undefined;
     /**
      * 世界书三级来源(M5,docs/10 §5.2):agentName → 来源列表(Agent/工作流/工作区)。
      * 不设 = 无世界书;单级抛错由评估器按级跳过(§5.2)。
@@ -141,7 +144,13 @@ function subagentTools(agent: AgentDefinition, env: RunNodeEnv): string[] {
     const allow = agent.tools;
     const spawnNames = normalizeSubagentSpecs(agent).map((s) => spawnToolName(s.name));
     if (!allow || allow.length === 0) return spawnNames; // 缺省 = 仅 spawn_*(10 §2.1 + §6)
-    return allow.filter((t) => env.hostToolNames.has(t)).concat(spawnNames); // 白名单 ∩ 宿主 + spawn_*(缺失静默忽略,10 §4)
+    // ask_user 不做宿主存在性过滤:子会话由本扩展的桥接工具同名提供(宿主工具表
+    // 的 ask_user 是 pi-web 注册在宿主 session 的,pi.getAllTools() 在工作流唤醒
+    // 时不一定可见——实测导致桥接未注册,模型只能以文本硬输出问题)。
+    // 其余工具仍按白名单 ∩ 宿主(缺失静默忽略,10 §4)。
+    const bridged = allow.includes(ASK_USER_TOOL_NAME) ? [ASK_USER_TOOL_NAME] : [];
+    const rest = allow.filter((t) => t !== ASK_USER_TOOL_NAME && env.hostToolNames.has(t));
+    return [...rest, ...bridged].concat(spawnNames);
 }
 
 /** M6 池键透传(spawn inherit 键 = 父键 + sub:<name>;§3.3)+ M7 记账父路径(§6) */
@@ -246,17 +255,82 @@ async function createSubSession(
     };
     const spawnTools = createSpawnTools(spawnDeps);
 
+    // ask_user 桥接工具(见 stream-events.ASK_USER_TOOL_NAME):白名单含 ask_user
+    // 即注册同名桥接(不依赖宿主工具表——pi.getAllTools() 在工作流唤醒时未必可见
+    // pi-web 的 ask_user,实测此门槛导致桥接未注册)。execute 只返回 terminate 结果,
+    // 真实执行在宿主 agent loop(pi-web 本体;pi-web 侧需开启 askUser 配置,否则
+    // 宿主执行时报 unknown tool,模型会看到该错误)。事件由 execute 里的订阅
+    // (toolcall_end)发出——不用创建时 env 发(池内 inherit 复用会引用旧唤醒的
+    // segmenter,导致事件丢失/串唤醒)。
+    const askTools: ToolDefinition[] = subagentTools(agent, env).includes(ASK_USER_TOOL_NAME)
+        ? [createAskUserBridgeTool()]
+        : [];
+    const customTools = [...spawnTools, ...askTools];
+
     const { session } = await createAgentSession({
         cwd: env.cwd(),
         sessionManager,
         settingsManager,
         resourceLoader,
         tools: subagentTools(agent, env),
-        ...(spawnTools.length > 0 ? { customTools: spawnTools } : {}),
+        ...(customTools.length > 0 ? { customTools } : {}),
         ...(model !== undefined ? { model: model as never } : {}),
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     });
     return { session, sessionManager };
+}
+
+/**
+ * ask_user 桥接工具(子会话侧):参数 schema 与 pi-web askUserTool 对齐
+ * (id/question/detail/options/multiple),execute 返回 terminate:true——子会话
+ * run 即止;ask-user NodeEvent 由节点执行订阅在 toolcall_end 时发出(不带 env 闭包)。
+ */
+function createAskUserBridgeTool(): ToolDefinition {
+    return defineTool({
+        name: ASK_USER_TOOL_NAME,
+        label: 'Ask user',
+        description:
+            'Post a set of questions to the user as a browser form and end this run. Answers arrive later as a follow-up message; the user may leave any question unanswered.',
+        parameters: Type.Object({
+            questions: Type.Array(
+                Type.Object({
+                    id: Type.String({
+                        description: 'Unique within this call; used as the answer key reported back to you.',
+                    }),
+                    question: Type.String({ description: 'The question itself, as one plain-text line.' }),
+                    detail: Type.Optional(
+                        Type.String({ description: 'Optional supporting context shown under the question.' }),
+                    ),
+                    options: Type.Optional(
+                        Type.Array(
+                            Type.Object({
+                                value: Type.String({
+                                    description:
+                                        'Stable machine value reported back to you when the user picks this option.',
+                                }),
+                                label: Type.String({ description: 'Short label the user reads, ideally a few words.' }),
+                                detail: Type.Optional(
+                                    Type.String({ description: 'Optional clarification shown under the label.' }),
+                                ),
+                            }),
+                            { description: 'Options to choose from. Omit when free text is the whole answer.' },
+                        ),
+                    ),
+                    multiple: Type.Optional(
+                        Type.Boolean({
+                            description: 'Allow several options at once. Default: one answer per question.',
+                        }),
+                    ),
+                }),
+                { minItems: 1, description: 'The questions to post, in the order the user should read them.' },
+            ),
+        }),
+        execute: async () => ({
+            content: [{ type: 'text', text: ASK_USER_POSTED_TEXT }],
+            details: { bridged: true },
+            terminate: true,
+        }),
+    }) as unknown as ToolDefinition;
 }
 
 /** 系统提示词基座列表(10 §5.1:string 视为单元素) */
@@ -286,6 +360,26 @@ export class AbortedError extends Error {
     constructor(message = '用户中断') {
         super(message);
         this.name = 'AbortedError';
+    }
+}
+
+/**
+ * ask 挂起错误:节点末轮以桥接 ask_user 调用收尾(terminate 即止),工作流在
+ * 此提前落定——提问已转发宿主,回答以 followUp 唤醒(新唤醒),继续跑后续节点
+ * 只会浪费 token 且结果无人消费。runtime 捕获后按正常落定形态收尾
+ * (text = 提问节点已产出的文本,terminal = 该节点)。
+ */
+export class AskPostedError extends Error {
+    constructor(
+        /** 发起提问的节点键(工作流提前终点) */
+        readonly nodeKey: string,
+        /** 提问节点已产出的文本(桥接 terminate 前的末轮文本,常为空) */
+        readonly partialText: string,
+        /** 该节点本次唤醒的执行轮次(trail 记录用) */
+        readonly visit: number,
+    ) {
+        super('ask_user 已把问题提交给用户,工作流在此挂起等待回答');
+        this.name = 'AskPostedError';
     }
 }
 
@@ -378,30 +472,6 @@ export function createNodeExecutor(env: RunNodeEnv): NodeExecutorFactory {
             throw new Error(`子会话创建失败(${agentName}): ${error instanceof Error ? error.message : String(error)}`);
         }
 
-        if (sessionMode === 'inherit' && !ns.seeded) {
-            // §4.2 首唤醒:宿主历史压缩脚本作为第一条 user 消息先注入,再发本次输入。
-            // 历史为空(新会话首轮)则直接注入本次输入(等价 fresh 首轮)。
-            const digest = env.seedInputOf?.(nodeKey);
-            if (digest) {
-                env.warn?.(`节点 "${nodeKey}" inherit 首唤醒:导入宿主历史摘要 ${digest.length} 字`);
-                try {
-                    await ns.session.prompt(digest, { expandPromptTemplates: false, source: 'extension' });
-                } catch (error) {
-                    throw new Error(
-                        `节点 "${nodeKey}" 历史导入失败: ${error instanceof Error ? error.message : String(error)}`,
-                    );
-                }
-                const seedMsg = lastAssistant(ns.session.messages as AgentMessage[]);
-                if (seedMsg && seedMsg.stopReason === 'aborted') {
-                    throw new AbortedError(seedMsg.errorMessage ?? '用户中断');
-                }
-                if (seedMsg && seedMsg.stopReason === 'error') {
-                    throw new Error(seedMsg.errorMessage ?? '历史导入返回错误');
-                }
-            }
-            env.pool.markSeeded(env.flowName, nodeKey, ctx.wake.hostSessionId);
-        }
-
         // usage 增量记账(docs/40 §6;M7 持久化)+ 流事件透传(docs/30 §3)
         const usageAcc: UsageDelta = { ...ZERO };
         let llmRequests = 0;
@@ -442,8 +512,22 @@ export function createNodeExecutor(env: RunNodeEnv): NodeExecutorFactory {
                     curSourceKey = `${nodeKey}#${sourceSeq}`;
                     curSourceLabel = displayLabel;
                 } else if (e.type === 'toolcall_end') {
-                    // 真实工具调用 → 占位 agents_tool 透传(§4);宿主回放映射
                     toolCalls++;
+                    // ask_user 桥接调用 → 真实透传事件(宿主执行 pi-web 本体,浏览器弹表单);
+                    // 其余工具调用 → 占位 agents_tool 透传(§4)。载荷畸形时退占位(防御)。
+                    const askQ =
+                        e.toolCall.name === ASK_USER_TOOL_NAME
+                            ? (e.toolCall.arguments as { questions?: AskUserQuestionPayload[] } | undefined)?.questions
+                            : undefined;
+                    if (Array.isArray(askQ) && askQ.length > 0) {
+                        emit({
+                            kind: 'ask-user',
+                            sourceKey: curSourceKey,
+                            sourceLabel: curSourceLabel,
+                            ask: { questions: askQ },
+                        });
+                        return;
+                    }
                     emit({
                         kind: 'tool-call',
                         sourceKey: curSourceKey,
@@ -511,6 +595,11 @@ export function createNodeExecutor(env: RunNodeEnv): NodeExecutorFactory {
             throw new Error(lastMsg.errorMessage ?? '子会话返回错误');
         }
 
+        // ask 挂起检测:末轮以 ask_user 桥接调用收尾(terminate:true → 工作流止于此)
+        if (lastMsg && endsWithAskUser(lastMsg)) {
+            throw new AskPostedError(nodeKey, ns.session.getLastAssistantText() ?? '', ctx.visit);
+        }
+
         const text = ns.session.getLastAssistantText() ?? '';
         usageTotal = {
             input: usageTotal.input + usageAcc.input,
@@ -554,4 +643,12 @@ function lastAssistant(messages: AgentMessage[]): AssistantMessage | undefined {
         if (m && m.role === 'assistant') return m as AssistantMessage;
     }
     return undefined;
+}
+
+/** 末条 assistant 消息是否以 ask_user 工具调用收尾(stopReason toolUse + 末块 ask_user) */
+function endsWithAskUser(msg: AssistantMessage): boolean {
+    if (msg.stopReason !== 'toolUse') return false;
+    const calls = msg.content.filter((b) => (b as { type?: string }).type === 'toolCall');
+    const last = calls[calls.length - 1] as { name?: string } | undefined;
+    return last?.name === ASK_USER_TOOL_NAME;
 }

@@ -1,0 +1,9 @@
+# 构建产物(files 已含 dist,这里防止意外把中间产物带进去)
+dist/**/*.map
+*.tsbuildinfo
+
+# 开发文件
+test/
+scripts/
+node_modules/
+.*.swp
